@@ -296,7 +296,137 @@ bao $(bao_image): $(guest_images) $(bao_cfg) $(bao_src)
 
 ![image-20241129164128735](image/image-20241129164128735.png)
 
-# 三 TimHyper项目框架搭建
+# 三 TimHyper框架搭建
 
-根据上面对`bao`项目的编译框架的剖析，我们来搭建自己项目的框架
+## 3.1 项目框架搭建
 
+在分析完毕`Bao`的项目框架之后，我们就可以来搭建自己的项目框架了，我们的目标是探究`arm`架构下的虚拟化，因此其他平台的我们直接摒弃。使用`qemu-aarch64-virt`来作为实验平台，简化后的代码项目框架如下：
+
+![image-20241207143951032](image/image-20241207143951032.png)
+
+- `doc`目录为文档目录
+- `wkdir`为代码目录，会由`Makefile`来创建
+
+在`Bao`这个`Hypervisor`跑起来之前，对于`arm`架构需要运行两个重要的固件，一个是`atf-a`，一个是`uboot`，关于这两个固件的实现机制这里不做阐述，可以百度学习，只要知道在最终运行启动`Bao`之前，需要先运行`atf-a`再运行`uboot`，因此我们需要去下载源码编译生成固件。源码下载和编译的过程我都参考着写在了`Makefile`中
+
+首先是`atf-a`的`Makefile`：
+
+```makefile
+# atf.mk
+atf_repo:=https://github.com/bao-project/arm-trusted-firmware.git
+atf_src:=$(wrkdir_src)/arm-trusted-firmware-$(ARCH)
+atf_version:=bao/demo
+
+$(atf_src):
+	git clone --depth 1 --branch $(atf_version) $(atf_repo) $(atf_src)
+
+```
+
+然后是`uboot`的`Makefile`：
+
+```makefile
+# uboot.mk
+uboot_repo:=https://github.com/u-boot/u-boot.git
+uboot_version:=v2022.10
+uboot_src:=$(wrkdir_src)/u-boot
+
+$(uboot_src):
+	git clone --depth 1 --branch $(uboot_version) $(uboot_repo) $(uboot_src)
+
+
+define build-uboot
+$(strip $1): $(uboot_src)
+	$(MAKE) -C $(uboot_src) $(strip $2)
+	echo $(strip $3) >> $(uboot_src)/.config
+	$(MAKE) -C $(uboot_src) -j$(nproc) 
+	cp $(uboot_src)/u-boot.bin $$@
+endef
+
+u-boot: $(wrkdir_plat_imgs)/u-boot.bin
+```
+
+最后是主目录下的`Makefile`：
+
+```makefile
+SHELL:=bash
+ARCH=aarch64
+TimHyper:=$(abspath .)
+
+CROSS_COMPILE:=/home/timer/arm-toolchain/arm-gnu-toolchain-13.3.rel1-x86_64-aarch64-none-elf/bin/aarch64-none-elf-
+
+wrkdir:=$(TimHyper)/wkdir
+wrkdir_src:=$(wrkdir)/srcs
+wrkdir_bin:=$(wrkdir)/bin
+wrkdir_imgs:=$(wrkdir)/imgs
+wrkdir_plat_imgs:=$(wrkdir_imgs)
+
+wrkdirs=$(wrkdir) $(wrkdir_src) $(wrkdir_bin) $(wrkdir_plat_imgs) 
+
+# 创建工作文件夹
+ifeq ($(filter clean distclean, $(MAKECMDGOALS)),)
+$(shell mkdir -p $(wrkdirs))
+endif
+
+# 编译uboot
+include ./uboot.mk
+uboot_defconfig:=qemu_arm64_defconfig
+uboot_cfg_frag:="CONFIG_SYS_TEXT_BASE=0x60000000\nCONFIG_TFABOOT=y\n"
+uboot_image:=$(wrkdir_plat_imgs)/u-boot.bin
+$(eval $(call build-uboot, $(uboot_image), $(uboot_defconfig), $(uboot_cfg_frag)))
+
+# 编译ATF-A
+include ./atf.mk
+atf_plat:=qemu
+atf_targets:=bl1 fip 
+atf_flags+=BL33=$(wrkdir_plat_imgs)/u-boot.bin
+atf_flags+=QEMU_USE_GIC_DRIVER=QEMU_GICV3
+
+atf-fip:=$(wrkdir_plat_imgs)/flash.bin
+$(atf-fip): $(atf_src) $(uboot_image) 
+	$(MAKE) -C $(atf_src) PLAT=$(atf_plat) $(atf_targets) $(atf_flags) 
+	dd if=$(atf_src)/build/qemu/release/bl1.bin of=$(atf-fip)
+	dd if=$(atf_src)/build/qemu/release/fip.bin of=$(atf-fip) seek=64 bs=4096 conv=notrunc
+
+platform: $(atf-fip)
+
+qemu_arch:=$(ARCH)
+qemu_cmd:=qemu-system-$(qemu_arch)
+
+#运行qemu
+run: platform
+	@$(qemu_cmd) -nographic\
+		-M virt,secure=on,virtualization=on,gic-version=3 \
+		-cpu cortex-a53 -smp 4 -m 4G\
+		-bios $(atf-fip)\
+
+distclean:
+	rm -rf $(wrkdir)
+
+.PHONY: run
+```
+
+## 3.2  启动测试
+
+在主目录下执行`make platform`命令，会去自动下载`atf-a`和`uboot`的源码，然后执行编译操作，最后会将这两个固件打包成`flash.bin`，放在`wkdir/imgs/`目录下，最后我们执行`make run`指令来启动`qemu`：
+
+![image-20241207144928845](image/image-20241207144928845.png)
+
+通过启动的日志我们可以看见启动分为了好几个阶段
+
+![img](image/image-20240509165208325.png)
+
+这里的`bl33`就是`uboot`，`kernel`这里还没有引入，可以认为，我们后续需要分析的`Bao`就是`kernel`，它是由`uboot`来引导启动的。把`uboot`配置为`atf-a`的`bl33`是在编译时指定的：
+
+```makefile
+atf_flags+=BL33=$(wrkdir_plat_imgs)/u-boot.bin
+```
+
+`qemu`的退出指令为`ctrl + a, x`
+
+## 参考链接
+
+- [【ATF】TF-A概述 - Emma1111 - 博客园](https://www.cnblogs.com/Wangzx000/p/17792870.html)
+
+- [《STM32MP157嵌入式Linux驱动开发指南》第七章 TF-A初探 - 知乎](https://zhuanlan.zhihu.com/p/377835542)
+
+- [万字长文带你搞懂安全启动及ATF_atf是如何启动的-CSDN博客](https://blog.csdn.net/u012294613/article/details/134811897)
